@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from "react";
 import L from "leaflet";
-import { MapContainer, Marker, Popup, TileLayer, useMap } from "react-leaflet";
+import { MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import AuthPage from "./AuthPage.jsx";
 
@@ -211,12 +211,68 @@ function Hero() {
   );
 }
 
+function NlpAnalysisPanel({ analysis }) {
+  const categoryLabel = issueTypes.find(([value]) => value === analysis.suggested_category)?.[1]
+    || "Not classified";
+  const languageLabel = {
+    english: "English",
+    hindi: "Hindi",
+    gujarati: "Gujarati",
+    unknown: "Not detected",
+  }[analysis.detected_language] || analysis.detected_language;
+
+  return (
+    <section className="nlp-panel" aria-label="Automated report suggestions">
+      <div className="nlp-panel-heading">
+        <strong>Report analysis</strong>
+        <span>Local rules · suggestions only</span>
+      </div>
+      <p>
+        Language: <strong>{languageLabel}</strong>
+        {analysis.language_confidence > 0 && ` · ${Math.round(analysis.language_confidence * 100)}% script match`}
+      </p>
+      <p>
+        Suggested category: <strong>{categoryLabel}</strong>
+        {analysis.category_confidence > 0 && ` · ${Math.round(analysis.category_confidence * 100)}% rule match`}
+      </p>
+      {analysis.urgency_flag && (
+        <p className="nlp-warning"><strong>Possible urgency—please review:</strong> {analysis.urgency_reasons.join(", ")}</p>
+      )}
+      <p className={`nlp-spam-status ${analysis.spam_flag ? "nlp-warning" : "nlp-screening-ok"}`}>
+        <strong>Possible spam: {analysis.spam_flag ? "YES — review recommended" : "NO — no obvious signals found"}</strong>
+        {analysis.spam_flag
+          ? ` — ${analysis.spam_reasons.join("; ")}`
+          : " — automated checks found no known promotional, scam, or repetitive patterns."}
+      </p>
+      <p className="nlp-screening-note">This is an automated check, not a spam verdict. Reports are never blocked automatically.</p>
+      {analysis.summary && <p><strong>Short summary:</strong> {analysis.summary}</p>}
+      {analysis.entities?.length > 0 && (
+        <p><strong>Place hints:</strong> {analysis.entities.map((entity) => entity.text).join(", ")}</p>
+      )}
+      {analysis.duplicate_candidates?.length > 0 && (
+        <div className="nlp-duplicates">
+          <strong>Similar public reports to check</strong>
+          {analysis.duplicate_candidates.map((candidate) => (
+            <p key={candidate.id}>
+              {candidate.location}: {candidate.summary}
+              <span> ({Math.round(candidate.similarity * 100)}% text/location match)</span>
+            </p>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function ReportForm({ onSubmitted }) {
   const [form, setForm] = useState({ description: "", location: "", language: "auto" });
+  const [analysis, setAnalysis] = useState(null);
+  const [analyzing, setAnalyzing] = useState(false);
   const [photo, setPhoto] = useState(null);
   const [photoPreview, setPhotoPreview] = useState("");
   const [coordinates, setCoordinates] = useState(null);
   const [locationState, setLocationState] = useState("idle");
+  const [showPinPicker, setShowPinPicker] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
@@ -234,8 +290,36 @@ function ReportForm({ onSubmitted }) {
 
   function updateField(event) {
     setForm((current) => ({ ...current, [event.target.name]: event.target.value }));
+    setAnalysis(null);
     setError("");
     setSuccess("");
+  }
+
+  async function analyzeDraft() {
+    setAnalyzing(true);
+    setError("");
+    try {
+      const response = await fetch(`${API_URL}/nlp/analyze`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${localStorage.getItem("civicsense_token")}`,
+        },
+        body: JSON.stringify(form),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        const detail = result.detail;
+        throw new Error(typeof detail === "string" ? detail : "Could not analyze this report.");
+      }
+      setAnalysis(result);
+    } catch (analyzeError) {
+      setError(analyzeError instanceof TypeError
+        ? "Could not connect to CivicSense to analyze this report."
+        : analyzeError.message);
+    } finally {
+      setAnalyzing(false);
+    }
   }
 
   function selectPhoto(file) {
@@ -299,6 +383,7 @@ function ReportForm({ onSubmitted }) {
       setPhoto(null);
       setCoordinates(null);
       setLocationState("idle");
+      setShowPinPicker(false);
       setSuccess(`Your report is in. Reference: ${result.complaint.id.slice(0, 8).toUpperCase()}`);
       onSubmitted();
     } catch (submitError) {
@@ -333,6 +418,15 @@ function ReportForm({ onSubmitted }) {
           required
           rows={3}
         />
+        <button
+          className="nlp-analyze-button"
+          type="button"
+          onClick={analyzeDraft}
+          disabled={analyzing || form.description.trim().length < 5 || form.location.trim().length < 2}
+        >
+          {analyzing ? "Checking report…" : "✳ Check report with NLP"}
+        </button>
+        {analysis && <NlpAnalysisPanel analysis={analysis} />}
         <div className="photo-field">
           <label htmlFor="photo">Add a photo <span className="optional-label">OPTIONAL</span></label>
           {photo && photoPreview ? (
@@ -404,9 +498,31 @@ function ReportForm({ onSubmitted }) {
             <button className="location-pin-button" type="button" onClick={locateIssue} disabled={locationState === "loading"}>
               {locationState === "loading" ? "Getting location…" : coordinates ? "✓ Map location added" : "⌖ Pin this on the map"}
             </button>
+            <button
+              className="location-pin-button"
+              type="button"
+              onClick={() => setShowPinPicker((shown) => !shown)}
+            >
+              {showPinPicker ? "Hide map picker" : "⌖ Choose exact point on map"}
+            </button>
+            {showPinPicker && (
+              <>
+                <p className="location-hint">Click the map to place or move your report pin. You can zoom and pan to find the spot.</p>
+                <PinPickerMap
+                  coordinates={coordinates}
+                  onSelect={(point) => {
+                    setCoordinates(point);
+                    setLocationState("ready");
+                    setError("");
+                  }}
+                />
+              </>
+            )}
             {locationState === "error" && <span className="location-hint error-text">Location permission was unavailable. You can still submit without a map pin.</span>}
             {locationState === "unsupported" && <span className="location-hint error-text">This browser does not support location pins.</span>}
-            {coordinates && <span className="location-hint">Your approximate location will appear on the community map.</span>}
+            {coordinates && (
+              <span className="location-hint">This selected point will appear on the community map.</span>
+            )}
           </div>
           <div className="form-field language-field">
             <label htmlFor="language">Language</label>
@@ -464,26 +580,36 @@ function HowItWorks() {
   );
 }
 
+const DEFAULT_MAP_CENTER = [20.5937, 78.9629];
+
+function reportMapPosition(report) {
+  const latitude = Number(report.latitude);
+  const longitude = Number(report.longitude);
+  if (
+    report.latitude === null || report.latitude === undefined || report.latitude === ""
+    || report.longitude === null || report.longitude === undefined || report.longitude === ""
+    || !Number.isFinite(latitude) || !Number.isFinite(longitude)
+    || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180
+  ) return null;
+  return [latitude, longitude];
+}
+
 function MapBounds({ reports }) {
   const map = useMap();
   useEffect(() => {
-    const points = reports
-      .filter((report) => Number.isFinite(report.latitude) && Number.isFinite(report.longitude))
-      .map((report) => [report.latitude, report.longitude]);
+    const points = reports.map(reportMapPosition).filter(Boolean);
     if (points.length > 1) map.fitBounds(points, { padding: [30, 30], maxZoom: 14 });
     else if (points.length === 1) map.setView(points[0], 14);
-    else map.setView([23.2156, 72.6369], 12);
+    else map.setView(DEFAULT_MAP_CENTER, 5);
   }, [map, reports]);
   return null;
 }
 
 function CivicMap({ reports }) {
-  const mappedReports = reports.filter(
-    (report) => Number.isFinite(report.latitude) && Number.isFinite(report.longitude),
-  );
-  const center = mappedReports.length
-    ? [mappedReports[0].latitude, mappedReports[0].longitude]
-    : [23.2156, 72.6369];
+  const mappedReports = reports
+    .map((report) => ({ report, position: reportMapPosition(report) }))
+    .filter(({ position }) => position);
+  const center = mappedReports.length ? mappedReports[0].position : DEFAULT_MAP_CENTER;
 
   return (
     <div className="community-map" aria-label="Map of reported civic issues">
@@ -492,9 +618,9 @@ function CivicMap({ reports }) {
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
-        <MapBounds reports={mappedReports} />
-        {mappedReports.map((report) => (
-          <Marker key={report.id} position={[report.latitude, report.longitude]} icon={mapMarkerIcon}>
+        <MapBounds reports={mappedReports.map(({ report }) => report)} />
+        {mappedReports.map(({ report, position }) => (
+          <Marker key={report.id} position={position} icon={mapMarkerIcon}>
             <Popup>
               <strong>{report.description}</strong>
               <br />
@@ -506,8 +632,48 @@ function CivicMap({ reports }) {
         ))}
       </MapContainer>
       {mappedReports.length === 0 && (
-        <div className="map-empty-note">Reports with a map pin will appear here. Add one when you submit an issue.</div>
+        <div className="map-empty-note">
+          No reports have shared map pins yet. Reporters can use GPS or select a point on the report map.
+        </div>
       )}
+    </div>
+  );
+}
+
+function PinPickerEvents({ onSelect }) {
+  useMapEvents({
+    click(event) {
+      onSelect({ latitude: event.latlng.lat, longitude: event.latlng.lng });
+    },
+  });
+  return null;
+}
+
+function PinPickerViewport({ coordinates }) {
+  const map = useMap();
+  useEffect(() => {
+    if (coordinates) map.setView([coordinates.latitude, coordinates.longitude], Math.max(map.getZoom(), 15));
+  }, [coordinates, map]);
+  return null;
+}
+
+function PinPickerMap({ coordinates, onSelect }) {
+  const center = coordinates
+    ? [coordinates.latitude, coordinates.longitude]
+    : DEFAULT_MAP_CENTER;
+  return (
+    <div className="pin-picker-map" aria-label="Choose the report location on the map">
+      <MapContainer center={center} zoom={coordinates ? 15 : 5} scrollWheelZoom>
+        <TileLayer
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        />
+        <PinPickerViewport coordinates={coordinates} />
+        <PinPickerEvents onSelect={onSelect} />
+        {coordinates && (
+          <Marker position={[coordinates.latitude, coordinates.longitude]} icon={mapMarkerIcon} />
+        )}
+      </MapContainer>
     </div>
   );
 }
@@ -520,6 +686,15 @@ function Community({ refreshKey }) {
   const [filters, setFilters] = useState({ search: "", location: "", category: "", status: "", created_after: "", created_before: "" });
   const [appliedFilters, setAppliedFilters] = useState(filters);
   const [visibleCount, setVisibleCount] = useState(8);
+  const [refreshTick, setRefreshTick] = useState(0);
+  const mappedReportCount = reports.filter((report) => reportMapPosition(report)).length;
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      setRefreshTick((tick) => tick + 1);
+    }, 45000);
+    return () => window.clearInterval(intervalId);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -556,7 +731,7 @@ function Community({ refreshKey }) {
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [appliedFilters, refreshKey]);
+  }, [appliedFilters, refreshKey, refreshTick]);
 
   function updateFilter(event) {
     setFilters((current) => ({ ...current, [event.target.name]: event.target.value }));
@@ -591,7 +766,14 @@ function Community({ refreshKey }) {
       <div className="community-tools">
         <div className="community-section-heading">
           <div><span className="section-kicker">THE COMMUNITY MAP</span><h3>Issues around you</h3></div>
-          <span className="map-pin-privacy">Pins are optional and only added with your permission.</span>
+          <div className="map-heading-actions">
+            <span className="map-pin-privacy">
+              {mappedReportCount} {mappedReportCount === 1 ? "report has" : "reports have"} a map pin · sharing is optional
+            </span>
+            <button className="map-refresh-button" type="button" onClick={() => setRefreshTick((tick) => tick + 1)} disabled={loading}>
+              {loading ? "Updating…" : "↻ Refresh map"}
+            </button>
+          </div>
         </div>
         <CivicMap reports={reports} />
       </div>
@@ -823,6 +1005,27 @@ function ReportCard({ report, admin = false, community = false, onReview, review
         </div>
         {admin && (
           <p className="dashboard-reporter">Submitted by {report.reporter_name} · {report.reporter_email}</p>
+        )}
+        {admin && report.nlp_analyzed && (
+          <NlpAnalysisPanel analysis={{
+            detected_language: report.detected_language,
+            language_confidence: report.language_confidence,
+            suggested_category: report.suggested_category,
+            category_confidence: report.category_confidence,
+            urgency_flag: report.urgency_flag,
+            urgency_reasons: report.urgency_reasons,
+            summary: report.extractive_summary,
+            entities: report.entities,
+            spam_flag: report.spam_flag,
+            spam_reasons: report.spam_reasons,
+            duplicate_candidates: report.duplicate_candidates,
+          }} />
+        )}
+        {admin && !report.nlp_analyzed && (
+          <p className="admin-spam-status is-unavailable" role="status">
+            <strong>Possible spam: NOT ANALYZED</strong>
+            {" "}This report predates automated spam screening.
+          </p>
         )}
         {report.decline_reason && <p className="status-explanation decline-explanation"><strong>Review note:</strong> {report.decline_reason}</p>}
         {report.status === "approved" && !admin && (

@@ -19,10 +19,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from starlette.datastructures import UploadFile
 
+from app.nlp import analyze_report
+
 
 app = FastAPI(
     title="CivicSense API",
-    description="AI-powered multilingual public grievance management system",
+    description="Public grievance management with local rules-based NLP assistance",
     version="1.0.0",
 )
 
@@ -184,6 +186,77 @@ def initialize_auth_db():
             for column, data_type in migrations.items():
                 if column not in columns:
                     connection.execute(f"ALTER TABLE complaints ADD COLUMN {column} {data_type}")
+        nlp_migrations = {
+            "nlp_analyzed": "INTEGER NOT NULL DEFAULT 0",
+            "detected_language": "TEXT NOT NULL DEFAULT 'unknown'",
+            "language_confidence": "REAL NOT NULL DEFAULT 0",
+            "suggested_category": "TEXT NOT NULL DEFAULT 'unclassified'",
+            "category_confidence": "REAL NOT NULL DEFAULT 0",
+            "category_matches_json": "TEXT NOT NULL DEFAULT '[]'",
+            "urgency_flag": "INTEGER NOT NULL DEFAULT 0",
+            "urgency_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
+            "extractive_summary": "TEXT NOT NULL DEFAULT ''",
+            "entities_json": "TEXT NOT NULL DEFAULT '[]'",
+            "spam_flag": "INTEGER NOT NULL DEFAULT 0",
+            "spam_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
+            "duplicate_candidates_json": "TEXT NOT NULL DEFAULT '[]'",
+        }
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(complaints)")}
+        for column, data_type in nlp_migrations.items():
+            if column not in columns:
+                connection.execute(f"ALTER TABLE complaints ADD COLUMN {column} {data_type}")
+        connection.execute("""
+            UPDATE complaints
+            SET nlp_analyzed = 1
+            WHERE nlp_analyzed = 0
+              AND (
+                  extractive_summary != ''
+                  OR detected_language != 'unknown'
+                  OR spam_reasons_json != '[]'
+              )
+        """)
+        unanalyzed_complaints = connection.execute("""
+            SELECT id, description, location, language
+            FROM complaints
+            WHERE nlp_analyzed = 0
+        """).fetchall()
+        for complaint in unanalyzed_complaints:
+            analysis = analyze_report(
+                complaint["description"],
+                complaint["location"],
+                complaint["language"],
+            )
+            connection.execute("""
+                UPDATE complaints
+                SET nlp_analyzed = 1,
+                    detected_language = ?,
+                    language_confidence = ?,
+                    suggested_category = ?,
+                    category_confidence = ?,
+                    category_matches_json = ?,
+                    urgency_flag = ?,
+                    urgency_reasons_json = ?,
+                    extractive_summary = ?,
+                    entities_json = ?,
+                    spam_flag = ?,
+                    spam_reasons_json = ?,
+                    duplicate_candidates_json = ?
+                WHERE id = ?
+            """, (
+                analysis["detected_language"],
+                analysis["language_confidence"],
+                analysis["suggested_category"],
+                analysis["category_confidence"],
+                json.dumps(analysis["category_matches"], ensure_ascii=False),
+                int(analysis["urgency_flag"]),
+                json.dumps(analysis["urgency_reasons"], ensure_ascii=False),
+                analysis["summary"],
+                json.dumps(analysis["entities"], ensure_ascii=False),
+                int(analysis["spam_flag"]),
+                json.dumps(analysis["spam_reasons"], ensure_ascii=False),
+                json.dumps(analysis["duplicate_candidates"], ensure_ascii=False),
+                complaint["id"],
+            ))
         connection.execute("""
             CREATE TABLE IF NOT EXISTS complaint_events (
                 id TEXT PRIMARY KEY,
@@ -375,6 +448,36 @@ def admin_from_authorization(authorization):
     return user
 
 
+def visible_duplicate_reports(connection, user_id):
+    rows = connection.execute(
+        """
+        SELECT id, description, location, category
+        FROM complaints
+        WHERE status IN ('approved', 'resolved') OR user_id = ?
+        ORDER BY created_at DESC
+        LIMIT 500
+        """,
+        (user_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def deserialize_nlp_record(row):
+    record = dict(row)
+    for response_key, storage_key in (
+        ("category_matches", "category_matches_json"),
+        ("urgency_reasons", "urgency_reasons_json"),
+        ("entities", "entities_json"),
+        ("spam_reasons", "spam_reasons_json"),
+        ("duplicate_candidates", "duplicate_candidates_json"),
+    ):
+        record[response_key] = json.loads(record.pop(storage_key, "[]"))
+    record["urgency_flag"] = bool(record.get("urgency_flag"))
+    record["spam_flag"] = bool(record.get("spam_flag"))
+    record["nlp_analyzed"] = bool(record.get("nlp_analyzed", False))
+    return record
+
+
 @app.post("/auth/register", status_code=201)
 def register(request: RegistrationRequest):
     email = request.email
@@ -440,6 +543,19 @@ def health_check():
     }
 
 
+@app.post("/nlp/analyze")
+def preview_nlp_analysis(complaint_request: ComplaintRequest, request: Request):
+    user = user_from_authorization(request.headers.get("authorization"))
+    with get_auth_db() as connection:
+        existing = visible_duplicate_reports(connection, user["id"])
+    return analyze_report(
+        complaint_request.description.strip(),
+        complaint_request.location.strip(),
+        complaint_request.language,
+        existing,
+    )
+
+
 @app.post("/complaints", status_code=201)
 async def create_complaint(request: Request):
     user = user_from_authorization(request.headers.get("authorization"))
@@ -500,12 +616,21 @@ async def create_complaint(request: Request):
     complaint_id = str(uuid4())
 
     normalized_language = complaint_request.language.lower().strip()
+    description = complaint_request.description.strip()
+    location = complaint_request.location.strip()
+    with get_auth_db() as connection:
+        analysis = analyze_report(
+            description,
+            location,
+            normalized_language,
+            visible_duplicate_reports(connection, user["id"]),
+        )
 
     complaint = {
         "id": complaint_id,
         "user_id": user["id"],
-        "description": complaint_request.description.strip(),
-        "location": complaint_request.location.strip(),
+        "description": description,
+        "location": location,
         "language": normalized_language,
         "category": "unclassified",
         "priority": "normal",
@@ -524,8 +649,12 @@ async def create_complaint(request: Request):
             """
             INSERT INTO complaints (
                 id, user_id, description, location, language,
-                category, priority, status, created_at, photo_url, latitude, longitude
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                category, priority, status, created_at, photo_url, latitude, longitude,
+                detected_language, language_confidence, suggested_category,
+                category_confidence, category_matches_json, urgency_flag,
+                urgency_reasons_json, extractive_summary, entities_json, spam_flag,
+                spam_reasons_json, duplicate_candidates_json, nlp_analyzed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 complaint["id"],
@@ -540,6 +669,19 @@ async def create_complaint(request: Request):
                 complaint["photo_url"],
                 complaint["latitude"],
                 complaint["longitude"],
+                analysis["detected_language"],
+                analysis["language_confidence"],
+                analysis["suggested_category"],
+                analysis["category_confidence"],
+                json.dumps(analysis["category_matches"], ensure_ascii=False),
+                int(analysis["urgency_flag"]),
+                json.dumps(analysis["urgency_reasons"], ensure_ascii=False),
+                analysis["summary"],
+                json.dumps(analysis["entities"], ensure_ascii=False),
+                int(analysis["spam_flag"]),
+                json.dumps(analysis["spam_reasons"], ensure_ascii=False),
+                json.dumps(analysis["duplicate_candidates"], ensure_ascii=False),
+                1,
             ),
         )
         connection.execute(
@@ -560,6 +702,7 @@ async def create_complaint(request: Request):
     return {
         "message": "Complaint submitted successfully",
         "complaint": {key: value for key, value in complaint.items() if key != "user_id"},
+        "analysis": analysis,
     }
 
 
@@ -572,6 +715,10 @@ def get_complaints(request: Request):
             SELECT complaints.id, description, location, language, category, priority,
                    status, created_at, photo_url, latitude, longitude, department,
                    response_due_at, decline_reason,
+                   detected_language, language_confidence, suggested_category,
+                   category_confidence, category_matches_json, urgency_flag,
+                   urgency_reasons_json, extractive_summary, entities_json,
+                   spam_flag, spam_reasons_json, duplicate_candidates_json, nlp_analyzed,
                    (SELECT MAX(created_at) FROM complaint_events
                     WHERE complaint_id = complaints.id AND event_type = 'status'
                     AND message = 'Your report was marked resolved') AS resolved_at,
@@ -585,7 +732,7 @@ def get_complaints(request: Request):
             """,
             (user["id"], user["id"]),
         ).fetchall()
-    complaints = [dict(row) for row in rows]
+    complaints = [deserialize_nlp_record(row) for row in rows]
     return {
         "total": len(complaints),
         "complaints": complaints,
@@ -685,6 +832,13 @@ def get_all_complaints(
                    complaints.status, complaints.created_at, complaints.photo_url,
                    complaints.latitude, complaints.longitude, complaints.department,
                    complaints.response_due_at, complaints.decline_reason,
+                   complaints.detected_language, complaints.language_confidence,
+                   complaints.suggested_category, complaints.category_confidence,
+                   complaints.category_matches_json, complaints.urgency_flag,
+                   complaints.urgency_reasons_json, complaints.extractive_summary,
+                   complaints.entities_json, complaints.spam_flag,
+                   complaints.spam_reasons_json, complaints.duplicate_candidates_json,
+                   complaints.nlp_analyzed,
                    (SELECT MAX(created_at) FROM complaint_events
                     WHERE complaint_id = complaints.id AND event_type = 'status'
                     AND message = 'Your report was marked resolved') AS resolved_at,
@@ -700,7 +854,7 @@ def get_all_complaints(
             """,
             values,
         ).fetchall()
-    complaints = [dict(row) for row in rows]
+    complaints = [deserialize_nlp_record(row) for row in rows]
     return {"total": len(complaints), "complaints": complaints}
 
 

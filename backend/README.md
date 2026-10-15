@@ -26,3 +26,7 @@ Only the configured account can access `/admin` and triage reports. Admins can a
 Signed-in residents can browse and filter community reports, view their status timelines, add updates, and support reports. Report owners receive in-app notifications about status changes and community updates. The community map uses OpenStreetMap tiles and only plots reports whose submitters explicitly chose to share their location; location sharing is optional. No email service or geocoder is configured.
 
 Residents can view their own submissions and review status at `/my-reports`. A declined report includes the reviewer’s reason, and resolved reports are surfaced in the community feed.
+
+## NLP assistance
+
+Report text is analyzed locally with rules-based heuristics. CivicSense suggests language, issue category, urgency, a short extractive summary, place hints, possible spam, and similar approved/resolved public reports. Residents can preview these hints before submission, and admins see the saved analysis during review. Hints never automatically change report status or priority; they are not a trained model or a measured accuracy claim.

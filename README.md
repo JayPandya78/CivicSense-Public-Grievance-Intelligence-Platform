@@ -9,6 +9,7 @@ CivicSense is a community platform for reporting local issues, tracking their st
 - Personal report history, status timelines, and in-app notifications
 - Community report search, filters, map, updates, and support
 - Admin triage with categories, departments, priorities, response targets, approval, decline reasons, and resolution
+- Rules-based NLP suggestions for language, category, urgency, report summaries, place hints, possible spam, and similar public reports
 
 ## Run locally
 
@@ -51,4 +52,8 @@ Only the configured account can access the admin review queue.
 
 The backend creates its SQLite database and uploaded-photo directory locally. They are excluded from Git because they contain user-specific data. Do not commit real user records, photos, credentials, or environment files.
 
-The community map uses OpenStreetMap tiles. Residents can submit without sharing coordinates; map pins are optional.
+The community map uses OpenStreetMap tiles and updates periodically or on request. Residents can submit without sharing coordinates; they can use browser GPS or choose an exact map point, and only reports with shared coordinates appear as pins.
+
+## NLP assistance
+
+CivicSense runs lightweight, rules-based text analysis locally when a report is previewed or submitted. It detects supported writing systems, suggests an issue category, flags urgency or possible spam for human review, extracts a short extractive summary and place hints, and compares the report with recent approved/resolved public reports. These are advisory heuristics—not a trained classifier, a decision to reject a report, or measured model accuracy. Staff must review the suggestions.
